@@ -38,8 +38,8 @@ jobs:
               applicationId 'com.me.autoaccept'
               minSdk 26
               targetSdk 34
-              versionCode 1
-              versionName '1.0'
+              versionCode 2
+              versionName '2.0'
             }
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
@@ -50,7 +50,7 @@ jobs:
           EOF
           cat > app/src/main/res/values/strings.xml <<'EOF'
           <resources>
-            <string name="desc">Reads offer card and taps Accept as per your rules</string>
+            <string name="desc">Reads the offer card and taps Accept as per your rules</string>
           </resources>
           EOF
           cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
@@ -63,6 +63,7 @@ jobs:
           EOF
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.VIBRATE"/>
             <application android:label="AutoAccept" android:theme="@android:style/Theme.Material.Light">
               <activity android:name=".MainActivity" android:exported="true">
                 <intent-filter>
@@ -84,12 +85,91 @@ jobs:
           package com.me.autoaccept
 
           import android.accessibilityservice.AccessibilityService
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
           import android.view.accessibility.AccessibilityNodeInfo
+          import android.widget.TextView
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class AcceptService : AccessibilityService() {
+            companion object { @Volatile var running = false }
+
             private var lastClick = 0L
             private var lastText = ""
+            private var wm: WindowManager? = null
+            private var fab: TextView? = null
+
+            private fun prefs() = getSharedPreferences("cfg", MODE_PRIVATE)
+
+            override fun onServiceConnected() {
+              super.onServiceConnected()
+              running = true
+              showFab()
+            }
+
+            override fun onUnbind(intent: android.content.Intent?): Boolean {
+              running = false
+              fab?.let { try { wm?.removeView(it) } catch (e: Exception) {} }
+              fab = null
+              return super.onUnbind(intent)
+            }
+
+            private fun paint() {
+              val on = prefs().getBoolean("on", false)
+              fab?.text = if (on) "ON" else "OFF"
+              (fab?.background as? GradientDrawable)?.setColor(
+                Color.parseColor(if (on) "#00A152" else "#757575"))
+            }
+
+            private fun showFab() {
+              if (fab != null) return
+              wm = getSystemService(WINDOW_SERVICE) as WindowManager
+              val v = TextView(this)
+              v.gravity = Gravity.CENTER
+              v.setTextColor(Color.WHITE)
+              v.textSize = 14f
+              v.background = GradientDrawable().apply { shape = GradientDrawable.OVAL }
+              val lp = WindowManager.LayoutParams(
+                150, 150,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT)
+              lp.gravity = Gravity.TOP or Gravity.START
+              lp.x = 20
+              lp.y = 300
+              v.setOnTouchListener(object : View.OnTouchListener {
+                var ix = 0; var iy = 0; var sx = 0f; var sy = 0f; var moved = false
+                override fun onTouch(view: View?, e: MotionEvent): Boolean {
+                  when (e.action) {
+                    MotionEvent.ACTION_DOWN -> { ix = lp.x; iy = lp.y; sx = e.rawX; sy = e.rawY; moved = false }
+                    MotionEvent.ACTION_MOVE -> {
+                      val dx = (e.rawX - sx).toInt(); val dy = (e.rawY - sy).toInt()
+                      if (Math.abs(dx) > 12 || Math.abs(dy) > 12) moved = true
+                      if (moved) { lp.x = ix + dx; lp.y = iy + dy; wm?.updateViewLayout(v, lp) }
+                    }
+                    MotionEvent.ACTION_UP -> if (!moved) {
+                      val p = prefs()
+                      p.edit().putBoolean("on", !p.getBoolean("on", false)).apply()
+                      paint()
+                    }
+                  }
+                  return true
+                }
+              })
+              fab = v
+              wm?.addView(v, lp)
+              paint()
+            }
 
             private fun collect(n: AccessibilityNodeInfo?, out: MutableList<String>) {
               if (n == null) return
@@ -97,11 +177,19 @@ jobs:
               for (i in 0 until n.childCount) collect(n.getChild(i), out)
             }
 
+            private fun log(line: String) {
+              val p = prefs()
+              val t = SimpleDateFormat("dd MMM HH:mm:ss", Locale.getDefault()).format(Date())
+              val old = p.getString("hist", "") ?: ""
+              val all = (listOf("$t  $line") + old.split("\n").filter { it.isNotBlank() }).take(30)
+              p.edit().putString("hist", all.joinToString("\n")).apply()
+            }
+
             override fun onAccessibilityEvent(e: AccessibilityEvent?) {
-              val p = getSharedPreferences("cfg", MODE_PRIVATE)
+              val p = prefs()
               if (!p.getBoolean("on", false)) return
               val pkg = e?.packageName?.toString() ?: return
-              val target = p.getString("pkg", "") ?: ""
+              val target = p.getString("pkg", "com.rapido.rider") ?: ""
               if (target.isEmpty() || pkg != target) return
               val root = rootInActiveWindow ?: return
               val texts = ArrayList<String>()
@@ -120,16 +208,38 @@ jobs:
               if (kms.size < 2) return
               val pickup = kms[0]
               val trip = kms[1]
-              val minTrip = p.getString("min", "0")?.toDoubleOrNull() ?: 0.0
-              val maxTrip = p.getString("max", "999")?.toDoubleOrNull() ?: 999.0
-              val maxPick = p.getString("pick", "999")?.toDoubleOrNull() ?: 999.0
+              val fare = Regex("""₹\s*(\d+(?:\.\d+)?)""").find(all)?.groupValues?.get(1)?.toDouble()
+
+              fun num(k: String, d: Double) = p.getString(k, "")?.toDoubleOrNull() ?: d
+              val minTrip = num("min", 0.0)
+              val maxTrip = num("max", 999.0)
+              val maxPick = num("pick", 999.0)
+              val minFare = num("fare", 0.0)
+              val minRate = num("rate", 0.0)
+
               if (pickup > maxPick || trip < minTrip || trip > maxTrip) return
+              if (minFare > 0 && (fare == null || fare < minFare)) return
+              if (minRate > 0 && (fare == null || trip <= 0 || fare / trip < minRate)) return
 
               val now = System.currentTimeMillis()
               if (now - lastClick < 2000) return
+              val info = "pickup ${pickup}km, trip ${trip}km" + (if (fare != null) ", ₹$fare" else "")
+
+              if (!p.getBoolean("active", false)) {
+                lastClick = now
+                log("MONITOR match: $info")
+                return
+              }
               var n: AccessibilityNodeInfo? = btn
               while (n != null && !n.isClickable) n = n.parent
-              if (n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) lastClick = now
+              if (n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                lastClick = now
+                log("ACCEPTED: $info")
+                try {
+                  val vb = getSystemService(VIBRATOR_SERVICE) as Vibrator
+                  vb.vibrate(VibrationEffect.createOneShot(300, VibrationEffect.DEFAULT_AMPLITUDE))
+                } catch (ex: Exception) {}
+              }
             }
 
             override fun onInterrupt() {}
@@ -140,47 +250,81 @@ jobs:
 
           import android.app.Activity
           import android.content.Intent
+          import android.graphics.Color
           import android.os.Bundle
           import android.provider.Settings
           import android.widget.*
 
           class MainActivity : Activity() {
+            private lateinit var checks: TextView
+            private lateinit var hist: TextView
+            private lateinit var last: TextView
+
+            private fun refresh() {
+              val p = getSharedPreferences("cfg", MODE_PRIVATE)
+              val ok = AcceptService.running
+              checks.text = if (ok) "Everything is working: Accessibility service connected."
+                else "Accessibility service OFF. Open Accessibility Settings and turn AutoAccept ON."
+              checks.setTextColor(Color.parseColor(if (ok) "#00794A" else "#C62828"))
+              hist.text = p.getString("hist", "") ?: ""
+              last.text = p.getString("last", "") ?: ""
+            }
+
+            override fun onResume() { super.onResume(); refresh() }
+
             override fun onCreate(s: Bundle?) {
               super.onCreate(s)
               val p = getSharedPreferences("cfg", MODE_PRIVATE)
               val ll = LinearLayout(this)
               ll.orientation = LinearLayout.VERTICAL
               ll.setPadding(32, 48, 32, 32)
-              val keys = listOf("pkg" to "Ride app package name", "btn" to "Accept button text",
-                "min" to "Min trip km", "max" to "Max trip km", "pick" to "Max pickup km")
-              val defs = mapOf("pkg" to "", "btn" to "Accept", "min" to "3.6", "max" to "149.9", "pick" to "4.0")
+
+              fun title(t: String) {
+                val tv = TextView(this); tv.text = t; tv.textSize = 18f
+                tv.setPadding(0, 32, 0, 8); ll.addView(tv)
+              }
+
+              title("Checks")
+              checks = TextView(this); ll.addView(checks)
+              val acc = Button(this); acc.text = "Open Accessibility Settings"
+              acc.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+              ll.addView(acc)
+
+              title("Status and Mode")
+              val sw = Switch(this); sw.text = "Auto accept ON (floating button bhi yahi chalata hai)"
+              sw.isChecked = p.getBoolean("on", false); ll.addView(sw)
+              val md = Switch(this); md.text = "Active mode (OFF = Monitor: sirf dekhe, tap na kare)"
+              md.isChecked = p.getBoolean("active", false); ll.addView(md)
+
+              title("Rules")
+              val keys = listOf(
+                "pkg" to "Ride app package", "btn" to "Accept button text",
+                "min" to "Min trip km", "max" to "Max trip km", "pick" to "Max pickup km",
+                "fare" to "Min fare Rs (0 = off)", "rate" to "Min Rs per km (0 = off)")
+              val defs = mapOf("pkg" to "com.rapido.rider", "btn" to "Accept", "min" to "3.6",
+                "max" to "149.9", "pick" to "4.0", "fare" to "0", "rate" to "0")
               val edits = HashMap<String, EditText>()
               for ((k, h) in keys) {
                 val tv = TextView(this); tv.text = h; ll.addView(tv)
                 val e = EditText(this); e.setText(p.getString(k, defs[k])); edits[k] = e; ll.addView(e)
               }
-              val sw = Switch(this)
-              sw.text = "Auto accept ON"
-              sw.isChecked = p.getBoolean("on", false)
-              ll.addView(sw)
               val save = Button(this); save.text = "Save"
               save.setOnClickListener {
                 val ed = p.edit()
                 for ((k, e) in edits) ed.putString(k, e.text.toString().trim())
-                ed.putBoolean("on", sw.isChecked).apply()
+                ed.putBoolean("on", sw.isChecked).putBoolean("active", md.isChecked).apply()
                 Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
               }
               ll.addView(save)
-              val acc = Button(this); acc.text = "Open Accessibility Settings"
-              acc.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-              ll.addView(acc)
-              val last = TextView(this)
-              last.setTextIsSelectable(true)
-              last.text = p.getString("last", "")
-              val ref = Button(this); ref.text = "Show last screen text"
-              ref.setOnClickListener { last.text = p.getString("last", "") }
+
+              title("Activity")
+              hist = TextView(this); ll.addView(hist)
+              title("Last screen text")
+              last = TextView(this); last.setTextIsSelectable(true); ll.addView(last)
+              val ref = Button(this); ref.text = "Refresh"
+              ref.setOnClickListener { refresh() }
               ll.addView(ref)
-              ll.addView(last)
+
               val sv = ScrollView(this)
               sv.addView(ll)
               setContentView(sv)
