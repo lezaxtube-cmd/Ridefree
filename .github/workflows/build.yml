@@ -1,0 +1,194 @@
+name: Build
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.7
+      - name: Create project
+        run: |
+          mkdir -p app/src/main/java/com/me/autoaccept app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "AutoAccept"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application' version '8.2.2' apply false
+            id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application'
+            id 'org.jetbrains.kotlin.android'
+          }
+          android {
+            namespace 'com.me.autoaccept'
+            compileSdk 34
+            defaultConfig {
+              applicationId 'com.me.autoaccept'
+              minSdk 26
+              targetSdk 34
+              versionCode 1
+              versionName '1.0'
+            }
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+            <string name="desc">Reads offer card and taps Accept as per your rules</string>
+          </resources>
+          EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+            android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+            android:accessibilityFeedbackType="feedbackGeneric"
+            android:canRetrieveWindowContent="true"
+            android:notificationTimeout="50"
+            android:description="@string/desc" />
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <application android:label="AutoAccept" android:theme="@android:style/Theme.Material.Light">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+              <service android:name=".AcceptService" android:exported="true"
+                android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                <intent-filter>
+                  <action android:name="android.accessibilityservice.AccessibilityService"/>
+                </intent-filter>
+                <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility_config"/>
+              </service>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/me/autoaccept/AcceptService.kt <<'EOF'
+          package com.me.autoaccept
+
+          import android.accessibilityservice.AccessibilityService
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class AcceptService : AccessibilityService() {
+            private var lastClick = 0L
+            private var lastText = ""
+
+            private fun collect(n: AccessibilityNodeInfo?, out: MutableList<String>) {
+              if (n == null) return
+              n.text?.toString()?.let { if (it.isNotBlank()) out.add(it) }
+              for (i in 0 until n.childCount) collect(n.getChild(i), out)
+            }
+
+            override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+              val p = getSharedPreferences("cfg", MODE_PRIVATE)
+              if (!p.getBoolean("on", false)) return
+              val pkg = e?.packageName?.toString() ?: return
+              val target = p.getString("pkg", "") ?: ""
+              if (target.isEmpty() || pkg != target) return
+              val root = rootInActiveWindow ?: return
+              val texts = ArrayList<String>()
+              collect(root, texts)
+              val all = texts.joinToString(" | ")
+              if (all != lastText) {
+                lastText = all
+                p.edit().putString("last", all).apply()
+              }
+              val btnText = p.getString("btn", "Accept") ?: "Accept"
+              val btn = root.findAccessibilityNodeInfosByText(btnText)
+                .firstOrNull { it.text?.toString()?.trim().equals(btnText, true) } ?: return
+
+              val kms = Regex("""(\d+(?:\.\d+)?)\s*km""", RegexOption.IGNORE_CASE)
+                .findAll(all).map { it.groupValues[1].toDouble() }.toList()
+              if (kms.size < 2) return
+              val pickup = kms[0]
+              val trip = kms[1]
+              val minTrip = p.getString("min", "0")?.toDoubleOrNull() ?: 0.0
+              val maxTrip = p.getString("max", "999")?.toDoubleOrNull() ?: 999.0
+              val maxPick = p.getString("pick", "999")?.toDoubleOrNull() ?: 999.0
+              if (pickup > maxPick || trip < minTrip || trip > maxTrip) return
+
+              val now = System.currentTimeMillis()
+              if (now - lastClick < 2000) return
+              var n: AccessibilityNodeInfo? = btn
+              while (n != null && !n.isClickable) n = n.parent
+              if (n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) lastClick = now
+            }
+
+            override fun onInterrupt() {}
+          }
+          EOF
+          cat > app/src/main/java/com/me/autoaccept/MainActivity.kt <<'EOF'
+          package com.me.autoaccept
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.*
+
+          class MainActivity : Activity() {
+            override fun onCreate(s: Bundle?) {
+              super.onCreate(s)
+              val p = getSharedPreferences("cfg", MODE_PRIVATE)
+              val ll = LinearLayout(this)
+              ll.orientation = LinearLayout.VERTICAL
+              ll.setPadding(32, 48, 32, 32)
+              val keys = listOf("pkg" to "Ride app package name", "btn" to "Accept button text",
+                "min" to "Min trip km", "max" to "Max trip km", "pick" to "Max pickup km")
+              val defs = mapOf("pkg" to "", "btn" to "Accept", "min" to "3.6", "max" to "149.9", "pick" to "4.0")
+              val edits = HashMap<String, EditText>()
+              for ((k, h) in keys) {
+                val tv = TextView(this); tv.text = h; ll.addView(tv)
+                val e = EditText(this); e.setText(p.getString(k, defs[k])); edits[k] = e; ll.addView(e)
+              }
+              val sw = Switch(this)
+              sw.text = "Auto accept ON"
+              sw.isChecked = p.getBoolean("on", false)
+              ll.addView(sw)
+              val save = Button(this); save.text = "Save"
+              save.setOnClickListener {
+                val ed = p.edit()
+                for ((k, e) in edits) ed.putString(k, e.text.toString().trim())
+                ed.putBoolean("on", sw.isChecked).apply()
+                Toast.makeText(this, "Saved", Toast.LENGTH_SHORT).show()
+              }
+              ll.addView(save)
+              val acc = Button(this); acc.text = "Open Accessibility Settings"
+              acc.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+              ll.addView(acc)
+              val last = TextView(this)
+              last.setTextIsSelectable(true)
+              last.text = p.getString("last", "")
+              val ref = Button(this); ref.text = "Show last screen text"
+              ref.setOnClickListener { last.text = p.getString("last", "") }
+              ll.addView(ref)
+              ll.addView(last)
+              val sv = ScrollView(this)
+              sv.addView(ll)
+              setContentView(sv)
+            }
+          }
+          EOF
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: app/build/outputs/apk/debug/app-debug.apk
